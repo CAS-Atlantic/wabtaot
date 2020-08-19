@@ -27,21 +27,6 @@
 
 #include <type_traits>
 
-#define CHECK_TRAP_HELPER(...)                \
-  do {                                           \
-    wabt::interp::Result result = (__VA_ARGS__); \
-    if (result != wabt::interp::Result::Ok) {    \
-      return static_cast<Result_t>(result);      \
-    }                                            \
-  } while (0)
-#define TRAP_HELPER(type) return static_cast<Result_t>(wabt::interp::Result::Trap##type)
-#define TRAP_UNLESS_HELPER(cond, type) TRAP_IF_HELPER(!(cond), type)
-#define TRAP_IF_HELPER(cond, type)  \
-  do {                       \
-    if (WABT_UNLIKELY(cond)) \
-      TRAP_HELPER(type);            \
-  } while (0)
-
 namespace wabt {
 namespace jit {
 
@@ -127,7 +112,13 @@ class FunctionBuilder : public TR::MethodBuilder {
   template <typename>
   TR::IlValue* CalculateShiftAmount(TR::IlBuilder* b, TR::IlValue* amount);
 
-  static Result_t CallIndirectHelper(ThreadInfo* th, Index table_index, Index sig_index, Index entry_index);
+  using Result_t = std::underlying_type<wabt::interp::Result>::type;
+
+  static Result_t CallHelper(wabt::interp::Thread* th, wabt::interp::IstreamOffset offset, uint8_t* current_pc);
+
+  static Result_t CallIndirectHelper(wabt::interp::Thread* th, Index table_index, Index sig_index, Index entry_index, uint8_t* current_pc);
+
+  static Result_t CallHostHelper(wabt::interp::Thread* th, Index func_index);
 
   static void* MemoryTranslationHelper(interp::Thread* th, uint32_t memory_id, uint64_t address, uint32_t size);
 

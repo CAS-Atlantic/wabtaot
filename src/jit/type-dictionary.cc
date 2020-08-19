@@ -20,6 +20,7 @@
 wabt::jit::TypeDictionary::TypeDictionary() : TR::TypeDictionary() {
     using namespace wabt::interp;
 
+
     // Currently, WABT allows v128 values on the physical value stack. JITted code does not yet
     // support accessing such values, but we still need to take into account that the size of the
     // Value union is larger than the largest field we can access. For now, this is done by adding
@@ -35,21 +36,25 @@ wabt::jit::TypeDictionary::TypeDictionary() : TR::TypeDictionary() {
     UnionField("Value", "f64", toIlType<double>(this));
     UnionField("Value", "__size_pad", LookupStruct("ValueSizePad"));
     CloseUnion("Value");
-
-    DefineStruct("CallFrame");
-    DefineField("CallFrame", "pc", toIlType<IstreamOffset>(this));
-    DefineField("CallFrame", "is_jit", Int8);
-    DefineField("CallFrame", "is_jit_compiling", Int8);
-    CloseStruct("CallFrame");
-
-    auto pCallFrame = PointerTo(LookupStruct("CallFrame"));
-
-    DefineStruct("ThreadInfo");
-    DefineField("ThreadInfo", "pc", Int32);
-    DefineField("ThreadInfo", "in_jit", Int32);
-    DefineField("ThreadInfo", "call_stack_max", pCallFrame);
-    DefineField("ThreadInfo", "call_stack", pCallFrame);
-    DefineField("ThreadInfo", "jit_fn_table", toIlType<void**>(this));
-    DefineField("ThreadInfo", "thread", toIlType<void*>(this));
-    CloseStruct("ThreadInfo");
 }
+/*
+wabt::jit::AOTTypeDictionary::AOTTypeDictionary() : OMR::JitBuilder::TypeDictionary() {
+    using namespace wabt::interp;
+    /*stackElement = DefineUnion("Value");
+    UnionField("Value", "i32", toIlType<decltype(Value::i32)>());
+    UnionField("Value", "i64", toIlType<decltype(Value::i64)>());
+    UnionField("Value", "f32", toIlType<float>());
+    UnionField("Value", "f64", toIlType<double>());
+    CloseUnion("Value");*//*
+    stackElement = toIlType<decltype(Value::i64)>();
+    stackElementPtr = PointerTo(stackElement);
+  stackTop = PointerTo(stackElementPtr);
+  auto name = "Thread";
+  thread = DefineStruct(name);
+  DefineField(name,"vs_array_",stackElementPtr,
+	      wabt::interp::ThreadOffset::so);
+  DefineField(name,"vs_top_",stackTop,wabt::interp::ThreadOffset::to);
+  CloseStruct(name);
+  threadPtr = PointerTo(thread);
+}
+*/

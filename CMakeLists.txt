@@ -1,3 +1,4 @@
+
 #
 # Copyright 2016 WebAssembly Community Group participants
 #
@@ -17,8 +18,8 @@
 cmake_minimum_required(VERSION 2.6)
 project(WABT)
 
-option(BUILD_TESTS "Build GTest-based tests" ON)
-option(BUILD_TOOLS "Build wabt commandline tools" ON)
+option(BUILD_TESTS "Build GTest-based tests" OFF)
+option(BUILD_TOOLS "Build wabt commandline tools" OFF)
 option(USE_ASAN "Use address sanitizer" OFF)
 option(USE_MSAN "Use memory sanitizer" OFF)
 option(USE_LSAN "Use leak sanitizer" OFF)
@@ -27,15 +28,25 @@ option(CODE_COVERAGE "Build with code coverage enabled" OFF)
 option(WITH_EXCEPTIONS "Build with exceptions enabled" ON)
 option(WERROR "Build with warnings as errors" OFF)
 
+list(APPEND CMAKE_MODULE_PATH
+	cmake/Modules
+	${CMAKE_CURRENT_LIST_DIR}/third_party/omr/cmake/modules/
+)
+
+set(OMR_CORE_GLUE_TARGET ON CACHE BOOL "")
+set(OMR_RAS_GLUE_TARGET ON CACHE BOOL "")
 set(OMR_DDR OFF CACHE BOOL "Enable DDR")
-set(OMR_EXAMPLE OFF CACHE BOOL "")
+set(OMR_EXAMPLE ON CACHE BOOL "")
 set(OMR_COMPILER  ON CACHE BOOL "")
 set(OMR_JITBUILDER ON CACHE BOOL "")
+set(OMR_JITBUILDER_TEST OFF CACHE BOOL "" FORCE)
+set(OMR_JITBUILDER_TEST_EXTENDED OFF CACHE BOOL "" FORCE)
+set(OMR_COMPILER ON CACHE BOOL "")
 set(OMR_GC OFF CACHE BOOL "")
 set(OMR_PORT ON CACHE BOOL "")
 set(OMR_THREAD ON CACHE BOOL "")
 set(OMR_TEST_COMPILER OFF CACHE BOOL "")
-set(OMR_OMRSIG OFF CACHE BOOL "")
+set(OMR_OMRSIG ON CACHE BOOL "")
 set(OMR_FVTEST OFF CACHE BOOL "")
 set(OMR_GC_SEGREGATED_HEAP OFF CACHE BOOL "")
 set(OMR_GC_MODRON_SCAVENGER OFF CACHE BOOL "")
@@ -45,7 +56,12 @@ set(OMR_NOTIFY_POLICY_CONTROL OFF CACHE BOOL "")
 set(OMR_THR_SPIN_WAKE_CONTROL OFF CACHE BOOL "")
 set(OMR_THR_SPIN_CODE_REFACTOR OFF CACHE BOOL "")
 set(OMR_THR_FORK_SUPPORT OFF CACHE BOOL "")
-set(OMR_WARNINGS_AS_ERRORS OFF CACHE BOOL "")
+set(OMR_WARNINGS_AS_ERRORS ON CACHE BOOL "")
+set(OMR_AOT ON CACHE BOOL "")
+
+set(OMR_SHARED_CACHE_MODS ON CACHE BOOL "")
+set(WASM_SHARED_CACHE ON CACHE BOOL "")
+set(OMR_SHARED_CACHE OFF CACHE BOOL "")
 
 if (CMAKE_C_COMPILER_ID MATCHES "Clang")
   set(COMPILER_IS_CLANG 1)
@@ -272,13 +288,20 @@ function(add_omr)
   # files.
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -w")
 
-  add_subdirectory(third_party/omr/example/glue EXCLUDE_FROM_ALL)
-  add_subdirectory(third_party/omr EXCLUDE_FROM_ALL)
+  #add_subdirectory(third_party/omr/example/glue EXCLUDE_FROM_ALL)
+  add_subdirectory(third_party/omr)
 endfunction()
 
 add_omr()
 add_subdirectory(src/jit)
+
+add_subdirectory(src/aot)
+# add_subdirectory(src/mix-aot)
+
+#target_link_libraries(libwabt PUBLIC wabtjit)
+
 target_link_libraries(wabt PUBLIC wabtjit)
+
 
 if (NOT EMSCRIPTEN)
   if (CODE_COVERAGE)
@@ -318,7 +341,8 @@ if (NOT EMSCRIPTEN)
       )
     endif ()
   endfunction()
-
+set(BUILD_TOOLS OFF)
+set(BUILD_TESTS OFF)
   if (BUILD_TOOLS)
     # wat2wasm
     wabt_executable(

@@ -18,6 +18,8 @@
 #define WABT_INTERP_H_
 
 #include <stdint.h>
+#include <elf.h>
+#include <stdio.h>
 
 #include <functional>
 #include <map>
@@ -25,10 +27,9 @@
 #include <utility>
 #include <vector>
 #include <unordered_map>
+#include <sys/mman.h>
 
 #include "src/jit/environment.h"
-#include "src/jit/thread.h"
-#include "src/jit/thunk.h"
 #include "src/binding-hash.h"
 #include "src/common.h"
 #include "src/opcode.h"
@@ -40,7 +41,79 @@ namespace jit {
 class FunctionBuilder;
 }
 
+namespace aot {
+class AOTFunctionBuilder;  
+}
+
 namespace interp {
+  
+class ELFLoader
+{
+public:
+  ELFLoader(char *elfFileName);
+
+  ~ELFLoader();
+  void *getTextSection();
+  Elf64_Sym *getSymbolTable();
+  unsigned int *getCustomSection();
+  void printHeader();
+  void printSymbolTable();
+  
+protected:
+  typedef Elf64_Ehdr ELFEHeader;
+  typedef Elf64_Shdr ELFSectionHeader;
+  typedef Elf64_Phdr ELFProgramHeader;
+  typedef Elf64_Addr ELFAddress;
+  typedef Elf64_Sym  ELFSymbol;
+  typedef Elf64_Rela ELFRela;
+  typedef Elf64_Off  ELFOffset;
+#define ELF_ST_INFO(bind, type) ELF64_ST_INFO(bind,type)
+#define ELF_ST_VISIBILITY(visibility) ELF64_ST_VISIBILITY(visibility)
+#define ELF_R_INFO(bind, type) ELF64_R_INFO(bind, type)
+#define ELFClass ELFCLASS64;
+#define BIT(x,n) (((x)>>(n))&1)
+
+  char       *_elfFileName;
+  FILE       *_elfFile;
+  ELFEHeader *_header;
+  
+  ELFSectionHeader *_zeroSection;
+  char              _zeroSectionName[1];
+  ELFSectionHeader *_textSection;
+  char              _textSectionName[6];
+  ELFSectionHeader *_relaSection;
+  char              _relaSectionName[11];
+  ELFSectionHeader *_dynSymSection;
+  char              _dynSymSectionName[8];
+  ELFSectionHeader *_shStrTabSection;
+  char              _shStrTabSectionName[10];
+  ELFSectionHeader *_dynStrSection;
+  char              _dynStrSectionName[8];
+  ELFSectionHeader *_customSection;
+  char              _customSectionName[8];
+
+  void *_text;
+  Elf64_Sym *_symtab;
+  char *_dynstr;
+  Elf64_Rela *_rela;
+  unsigned int *_custom;
+
+  void initialize();
+  void loadTextSection();
+  void loadSymTab();
+  void loadDynStr();
+  void loadRela();
+  void loadCustom();
+  char *typeString(ELFSectionHeader *);
+  char *flagString(ELFSectionHeader *);
+  char *symTypeString(Elf64_Sym);
+  char *symBindString(Elf64_Sym);
+  char *symVisString(Elf64_Sym);
+  char *symNdxString(Elf64_Sym);
+  char *symNameString(Elf64_Sym);
+  
+}; //class ELFLoader
+
 
 #define FOREACH_INTERP_RESULT(V)                                            \
   V(Ok, "ok")                                                               \
@@ -73,6 +146,7 @@ namespace interp {
   V(TrapHostResultTypeMismatch, "host result type mismatch")                \
   /* we called an import function, but it didn't complete succesfully */    \
   V(TrapHostTrapped, "host function trapped")                               \
+  V(TrapFailedAOTLookup, "AOT lookup failed")                               \
   /* we attempted to JIT compile a function and failed */                   \
   V(TrapFailedJITCompilation, "failed JIT compilation")                     \
   /* the data segment has been dropped. */                                  \
@@ -89,11 +163,14 @@ namespace interp {
   /* the expected export kind doesn't match. */                             \
   V(ExportKindMismatch, "export kind mismatch")
 
-enum class Result {
+enum class Result : int32_t {
 #define V(Name, str) Name,
   FOREACH_INTERP_RESULT(V)
 #undef V
 };
+
+extern bool trapFlag;
+extern Result trapResult;
 
 typedef uint32_t IstreamOffset;
 static const IstreamOffset kInvalidIstreamOffset = ~0;
@@ -124,10 +201,15 @@ struct Table {
 struct Memory {
   Memory() = default;
   explicit Memory(const Limits& limits)
-      : page_limits(limits), data(limits.initial * WABT_PAGE_SIZE) {}
+    : page_limits(limits){
+	madvise(data.data(), 2368709120*sizeof(char), MADV_SEQUENTIAL);
+	madvise(data.data(), 2368709120*sizeof(char), MADV_HUGEPAGE);  
+	madvise(data.data(), 2368709120*sizeof(char), MADV_WILLNEED);
+	
+      }
 
   Limits page_limits;
-  std::vector<char> data;
+  alignas(4096) std::array<char,2368709120> data;
 };
 
 struct DataSegment {
@@ -264,32 +346,36 @@ struct Func;
 struct Func {
   WABT_DISALLOW_COPY_AND_ASSIGN(Func);
   Func(Index sig_index, bool is_host)
-      : sig_index(sig_index), is_host(is_host) {}
+      : sig_index(sig_index), is_host(is_host),offset(kInvalidIstreamOffset) {}
   virtual ~Func() {}
 
   Index sig_index;
   bool is_host;
+  bool is_compiled = false;
+  std::string dbg_name_ = "???";
+  IstreamOffset offset;
 };
 
 struct DefinedFunc : Func {
   DefinedFunc(Index sig_index)
       : Func(sig_index, false),
-        offset(kInvalidIstreamOffset),
+        
         local_decl_count(0),
         local_count(0) {}
 
-  static bool classof(const Func* func) { return !func->is_host; }
+  static bool classof(const Func* func) { //return !func->is_host; 
+    return true;
+  }
 
-  std::string dbg_name_ = "???";
+  
   bool has_dbg_name_ = false;
 
-  uint32_t num_calls_ = 0;
-  bool tried_jit_ = false;
-  jit::JITedFunction jit_fn_ = nullptr;
-
-  IstreamOffset offset;
+  
   Index local_decl_count;
   Index local_count;
+  
+  // first the parameter types, and then the local types.
+  // the number of local types is given by local_count.
   std::vector<Type> param_and_local_types;
 };
 
@@ -306,7 +392,10 @@ struct HostFunc : Func {
       : Func(sig_index, true),
         module_name(module_name.to_string()),
         field_name(field_name.to_string()),
-        callback(callback) {}
+      // {
+  //  }
+      
+        callback(callback) { is_compiled = true; }
 
   static bool classof(const Func* func) { return func->is_host; }
 
@@ -367,6 +456,8 @@ struct DefinedModule : Module {
   Index start_func_index; /* kInvalidIndex if not defined */
   IstreamOffset istream_start;
   IstreamOffset istream_end;
+  std::vector<void*> compiled_functions;
+  std::vector<Func*> funcs;
 };
 
 struct HostModule : Module {
@@ -374,6 +465,8 @@ struct HostModule : Module {
   static bool classof(const Module* module) { return module->is_host; }
 
   Index OnUnknownFuncExport(string_view name, Index sig_index) override;
+  Export* GetExport(string_view, ExternalKind);
+  Index OnUnknownExport(string_view, ExternalKind);
 
   std::pair<HostFunc*, Index> AppendFuncExport(string_view name,
                                                const FuncSignature&,
@@ -408,6 +501,9 @@ struct HostModule : Module {
   std::function<
       Index(Environment*, HostModule*, string_view name, Index sig_index)>
       on_unknown_func_export;
+  std::function<
+      Index(Environment*, HostModule*, string_view name, ExternalKind)>
+      on_unknown_export;
 
  private:
   Environment* env_;
@@ -431,14 +527,19 @@ class Environment {
 
   bool enable_jit = true;
   bool trap_on_failed_comp = false;
+  bool enable_load_from_dlib = false;
+  bool enable_load_thunk = false;
+  char *infile = nullptr;
   uint32_t jit_threshold = 1;
 
   Environment();
+  ~Environment();
 
   OutputBuffer& istream() { return *istream_; }
   void SetIstream(std::unique_ptr<OutputBuffer> istream) {
     istream_ = std::move(istream);
   }
+  
   std::unique_ptr<OutputBuffer> ReleaseIstream() { return std::move(istream_); }
 
   Index GetFuncSignatureCount() const { return sigs_.size(); }
@@ -500,11 +601,12 @@ class Environment {
   template <typename... Args>
   Func* EmplaceBackFunc(Args&&... args) {
     funcs_.emplace_back(std::forward<Args>(args)...);
-    jit_funcs_.emplace_back(funcs_.back()->is_host ? jit::HostCallThunk : jit::InterpThunk);
+    return funcs_.back().get();
+  }
 
-    Func* f = funcs_.back().get();
-
-    return f;
+  void AddJitMetadata(Func* fn) {
+    assert(fn->offset != kInvalidIstreamOffset);
+    this->jit_meta_.insert({ fn->offset, JitMeta(fn) });
   }
 
   template <typename... Args>
@@ -553,7 +655,11 @@ class Environment {
     registered_module_bindings_.emplace(std::forward<Args>(args)...);
   }
 
+  uint64_t memoriesLoc(){ return reinterpret_cast<uint64_t>(memories_[0].data.data()); }
+  char **GetMems() {return mems;}
+
   HostModule* AppendHostModule(string_view name);
+  void AppendDefModule(DefinedModule*);
 
   bool FuncSignaturesAreEqual(Index sig_index_0, Index sig_index_1) const;
 
@@ -562,14 +668,36 @@ class Environment {
 
   void Disassemble(Stream* stream, IstreamOffset from, IstreamOffset to);
   void DisassembleModule(Stream* stream, Module*);
+  void LoadDLib(char *filename);
+  void FillMemories();
+  void FillTables();
+  uint64_t *indirectCallParams = new uint64_t[8]();
 
  private:
   friend class Thread;
   friend class wabt::jit::FunctionBuilder;
-  friend jit::Result_t jit::InterpThunk(jit::ThreadInfo*, Index);
-  friend jit::Result_t jit::HostCallThunk(jit::ThreadInfo*, Index);
+  friend class wabt::aot::AOTFunctionBuilder;
+  using JITedFunction = wabt::interp::Result (*)();
+  using AOTedFunction = uint64_t (*)();
 
-  Result TryJit(Thread* t, DefinedFunc* fn, Index ind);
+  struct JitMeta {
+    Func* wasm_fn;
+    uint32_t num_calls = 0;
+
+    bool tried_jit = false;
+    JITedFunction jit_fn = nullptr;
+
+    JitMeta(Func* wasm_fn) : wasm_fn(wasm_fn) {
+      //wasm_fn->dbg_name_= "func_" + std::to_string(numOfFunction);
+      // wasm_fn->dbg_name_= "f" + wasm_fn-> +"m"+modules_[0]->name.substr(0,3);
+      numOfFunction++;
+    }
+    private:
+    static int numOfFunction;
+  };
+
+  bool TryJit(Thread* t, IstreamOffset offset, JITedFunction* fn);
+  bool TryJit(Thread* t, IstreamOffset offset, JITedFunction* fn,DefinedFunc *&);
 
   std::vector<std::unique_ptr<Module>> modules_;
   std::vector<FuncSignature> sigs_;
@@ -583,18 +711,24 @@ class Environment {
   BindingHash module_bindings_;
   BindingHash registered_module_bindings_;
 
-  std::vector<jit::JITedFunction> jit_funcs_;
   jit::JitEnvironment jit_env_;
+  std::unordered_map<IstreamOffset, JitMeta> jit_meta_;
+  ELFLoader *elfLoader = nullptr;
+  char **mems = nullptr;
+  Func **tabs = nullptr;
 };
 
+
+struct ThreadOffset;
+ 
 struct CallFrame {
   CallFrame() : pc(0), is_jit(false), is_jit_compiling(false) {}
   CallFrame(IstreamOffset pc, bool is_jit, bool is_jit_compiling = false)
     : pc(pc), is_jit(is_jit), is_jit_compiling(is_jit_compiling) {}
 
   IstreamOffset pc;
-  int8_t is_jit;
-  int8_t is_jit_compiling;
+  bool is_jit;
+  bool is_jit_compiling;
 };
 
 class Thread {
@@ -625,13 +759,15 @@ class Thread {
 
   void Trace(Stream*);
   Result Run(int num_instructions = 1);
-
+  Result CallThunk(Environment::JITedFunction,Func*);
   Result CallHost(HostFunc*);
 
  private:
-  friend class jit::FunctionBuilder;
-  friend jit::Result_t jit::InterpThunk(jit::ThreadInfo*, Index);
+  friend class wabt::jit::FunctionBuilder;
+  friend class wabt::aot::AOTFunctionBuilder;
+  friend class ThreadOffset;
   friend class Executor;
+  
   const uint8_t* GetIstream() const { return env_->istream_->data.data(); }
 
   Memory* ReadMemory(const uint8_t** pc);
@@ -717,14 +853,21 @@ class Thread {
 
   Environment* env_ = nullptr;
   std::vector<Value> value_stack_;
+  //std::vector<IstreamOffset> call_stack_;
+  Value *vs_array_;
+  Value *vs_top_;
   std::vector<CallFrame> call_stack_;
+
   uint32_t value_stack_top_ = 0;
   uint32_t call_stack_top_ = 0;
   uint32_t last_jit_frame_ = 0;
   IstreamOffset pc_ = 0;
   bool in_jit_ = false;
+};
 
-  std::unique_ptr<jit::ThreadInfo> jit_th_;
+struct ThreadOffset {
+  static const std::size_t so = offsetof(Thread,vs_array_);
+  static const std::size_t to = offsetof(Thread,vs_top_);
 };
 
 struct ExecResult {

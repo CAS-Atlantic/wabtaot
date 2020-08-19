@@ -1,5 +1,5 @@
 /*
- * Copyright 2018 wasmjit-omr project participants
+ * Copyright 2017 wasmjit-omr project participants
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,24 +14,9 @@
  * limitations under the License.
  */
 
-#ifndef JIT_ENVIRONMENT_HPP
-#define JIT_ENVIRONMENT_HPP
+#include "aot-type-dictionary.h"
+#include "src/interp/interp.h"
 
-#include <vector>
-
-namespace wabt {
-namespace jit {
-
-class JitEnvironment {
-public:
-  std::vector<unsigned int> *offsets = 0;
-  JitEnvironment();
-  ~JitEnvironment();
-private:
-  static unsigned short instance_count_;
-};
-
+wabt::aot::AOTTypeDictionary::AOTTypeDictionary() : wabt::jit::TypeDictionary()
+{
 }
-}
-
-#endif // JIT_ENVIRONMENT_HPP

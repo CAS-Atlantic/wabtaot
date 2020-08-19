@@ -23,17 +23,25 @@
 #include <limits>
 #include <type_traits>
 #include <vector>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <string>
 
 #include "src/interp/interp-internal.h"
 
 #include "src/cast.h"
 #include "src/stream.h"
+#include "JitBuilder.hpp"
+#include <dlfcn.h>
 
-#include "src/jit/thread.h"
 #include "src/jit/wabtjit.h"
 
 namespace wabt {
 namespace interp {
+
+bool trapFlag = false;
+Result trapResult = Result::Ok;
 
 // Differs from the normal CHECK_RESULT because this one is meant to return the
 // interp Result type.
@@ -133,6 +141,19 @@ void WriteCall(Stream* stream,
 
 Environment::Environment() : istream_(new OutputBuffer()) {}
 
+Environment::~Environment() {
+  std::vector<unsigned int> *offsets = new std::vector<unsigned int>();
+  for(auto kv:jit_meta_) {
+    offsets->push_back(kv.first);
+  }
+  jit_env_.offsets = offsets;
+  if(enable_load_from_dlib)
+    delete elfLoader;
+  delete [] indirectCallParams;
+}
+
+int Environment::JitMeta::numOfFunction = 0;
+
 Index Environment::FindModuleIndex(string_view name) const {
   auto iter = module_bindings_.find(name.to_string());
   if (iter == module_bindings_.end()) {
@@ -160,11 +181,8 @@ Thread::Options::Options(uint32_t value_stack_size, uint32_t call_stack_size)
 Thread::Thread(Environment* env, const Options& options)
     : env_(env),
       value_stack_(options.value_stack_size),
-      call_stack_(options.call_stack_size),
-      jit_th_(new jit::ThreadInfo()) {
-  jit_th_->call_stack_max = call_stack_.data() + call_stack_.size();
-  jit_th_->jit_fn_table = nullptr;
-  jit_th_->thread = this;
+      call_stack_(options.call_stack_size) {
+  vs_top_ = value_stack_.data()-1;
 }
 
 FuncSignature::FuncSignature(std::vector<Type> param_types,
@@ -227,6 +245,20 @@ Export* Module::GetExport(string_view name) {
   return &exports[field_index];
 }
 
+Export* HostModule::GetExport(string_view name, ExternalKind kind) {
+  int field_index = export_bindings.FindIndex(name);
+  if (field_index < 0) {
+    Index index = OnUnknownExport(name, kind);
+    if (index != kInvalidIndex) {
+      Export* export_ = &exports[index];
+      //assert(export_->name.compare(name) == 0);
+      return export_;
+    }
+    return nullptr;
+  }
+  return &exports[field_index];
+}
+
 Index Module::AppendExport(ExternalKind kind,
                            Index item_index,
                            string_view name) {
@@ -240,7 +272,8 @@ DefinedModule::DefinedModule()
     : Module(false),
       start_func_index(kInvalidIndex),
       istream_start(kInvalidIstreamOffset),
-      istream_end(kInvalidIstreamOffset) {}
+      istream_end(kInvalidIstreamOffset) {
+      }
 
 HostModule::HostModule(Environment* env, string_view name)
     : Module(name, true), env_(env) {}
@@ -248,6 +281,13 @@ HostModule::HostModule(Environment* env, string_view name)
 Index HostModule::OnUnknownFuncExport(string_view name, Index sig_index) {
   if (on_unknown_func_export) {
     return on_unknown_func_export(env_, this, name, sig_index);
+  }
+  return kInvalidIndex;
+}
+
+Index HostModule::OnUnknownExport(string_view name, ExternalKind kind) {
+  if (on_unknown_export) {
+    return on_unknown_export(env_, this, name, kind);
   }
   return kInvalidIndex;
 }
@@ -382,8 +422,6 @@ void Environment::ResetToMarkPoint(const MarkPoint& mark) {
   elem_segments_.erase(elem_segments_.begin() + mark.elem_segments_size,
                        elem_segments_.end());
   istream_->data.resize(mark.istream_size);
-
-  jit_funcs_.erase(jit_funcs_.begin() + mark.funcs_size, jit_funcs_.end());
 }
 
 HostModule* Environment::AppendHostModule(string_view name) {
@@ -392,6 +430,12 @@ HostModule* Environment::AppendHostModule(string_view name) {
   registered_module_bindings_.emplace(name.to_string(),
                                       Binding(modules_.size() - 1));
   return module;
+}
+
+void Environment::AppendDefModule(DefinedModule *module){
+  modules_.emplace_back(module);
+  registered_module_bindings_.emplace(module->name,
+                                      Binding(modules_.size() - 1));
 }
 
 uint32_t ToRep(bool x) { return x ? 1 : 0; }
@@ -664,14 +708,14 @@ Value MakeValue(ValueTypeRep<T>);
 
 template <>
 Value MakeValue<uint32_t>(uint32_t v) {
-  Value result;
+  Value result {0};
   result.i32 = v;
   return result;
 }
 
 template <>
 Value MakeValue<int32_t>(uint32_t v) {
-  Value result;
+  Value result {0};
   result.i32 = v;
   return result;
 }
@@ -692,7 +736,7 @@ Value MakeValue<int64_t>(uint64_t v) {
 
 template <>
 Value MakeValue<float>(uint32_t v) {
-  Value result;
+  Value result {0};
   result.f32_bits = v;
   return result;
 }
@@ -810,16 +854,30 @@ void Thread::Reset() {
   pc_ = 0;
   value_stack_top_ = 0;
   call_stack_top_ = 0;
+  vs_top_ = value_stack_.data()-1;
 }
 
 Result Thread::Push(Value value) {
   CHECK_STACK();
   value_stack_[value_stack_top_++] = value;
+  /**vs_top_ = value;
+     value_stack_top_++;*/
+  //if(value_stack_top_>1)
+  vs_top_++;
   return Result::Ok;
 }
 
 Value Thread::Pop() {
+  /*if(vs_top_!=value_stack_.data()-1)*/
+  vs_top_--;
   return value_stack_[--value_stack_top_];
+  /*--value_stack_top_;
+  if(value_stack_top_<0)
+    value_stack_top_=0;
+  if(vs_top_ == value_stack_.data())
+    return *vs_top_;
+  else
+  return *vs_top_--;*/
 }
 
 Value Thread::ValueAt(Index at) const {
@@ -1639,25 +1697,80 @@ ValueTypeRep<R> SimdReplaceLane(V value, uint32_t lane_idx, T lane_val) {
   return ToRep(Bitcast<R>(simd_data_0));
 }
 
-Result Environment::TryJit(Thread* t, DefinedFunc* fn, Index ind) {
+bool Environment::TryJit(Thread* t, IstreamOffset offset, Environment::JITedFunction* fn) {
   if (!enable_jit) {
-    return Result::Ok;
+    *fn = nullptr;
+    return false;
   }
 
-  if (!fn->tried_jit_) {
-    fn->num_calls_++;
+  auto meta_it = jit_meta_.find(offset);
 
-    if (fn->num_calls_ >= jit_threshold) {
-      fn->jit_fn_ = jit::compile(t, fn);
-      fn->tried_jit_ = true;
+  if (meta_it != jit_meta_.end()) {
+    auto* meta = &meta_it->second;
+    if (!meta->tried_jit) {
+      meta->num_calls++;
 
-      if (fn->jit_fn_)
-        jit_funcs_[ind] = fn->jit_fn_;
+      if (meta->num_calls >= jit_threshold) {
+	/*if(enable_load_from_dlib) {
+	//if(0){
+	  meta->jit_fn = jit::loadCompiled(t,meta->wasm_fn,*this);
+	  meta->tried_jit = true;
+	}else{*/
+	  meta->jit_fn = jit::compile(t, meta->wasm_fn);
+	  meta->tried_jit = true;
+	//}
+      } else {
+        *fn = nullptr;
+        return false;
+      }
     }
+    *fn = meta->jit_fn;
+    return trap_on_failed_comp || *fn;
+  } else {
+    *fn = nullptr;
+    return trap_on_failed_comp;
+  }
+}
+
+bool Environment::TryJit(Thread* t, IstreamOffset offset, Environment::JITedFunction* fn,DefinedFunc *&df) {
+  if (!enable_jit) {
+    *fn = nullptr;
+    return false;
   }
 
-  TRAP_IF(fn->tried_jit_ && !fn->jit_fn_ && trap_on_failed_comp, FailedJITCompilation);
-  return Result::Ok;
+  auto meta_it = jit_meta_.find(offset);
+
+  if (meta_it != jit_meta_.end()) {
+    auto* meta = &meta_it->second;
+    if (!meta->tried_jit) {
+      meta->num_calls++;
+
+      if (meta->num_calls >= jit_threshold) {
+/*	if(enable_load_thunk){
+	  df = dynamic_cast<DefinedFunc*>(meta->wasm_fn);
+	  meta->jit_fn = jit::loadThunk(t,meta->wasm_fn,*this);
+	  //meta->tried_jit = true;
+	} else if(enable_load_from_dlib) {
+	//if(0){
+	  meta->jit_fn = jit::loadCompiled(t,meta->wasm_fn,*this);
+	  meta->tried_jit = true;
+	}else{*/
+	  meta->jit_fn = jit::compile(t, meta->wasm_fn);
+	  meta->tried_jit = true;
+	//}
+     
+    } else {
+        *fn = nullptr;
+        return false;
+      }
+    }
+    *fn = meta->jit_fn;
+    df = dynamic_cast<DefinedFunc*>(meta->wasm_fn);
+    return trap_on_failed_comp || *fn;
+  } else {
+    *fn = nullptr;
+    return trap_on_failed_comp;
+  }
 }
 
 bool Environment::FuncSignaturesAreEqual(Index sig_index_0,
@@ -1828,35 +1941,146 @@ Result Thread::Run(int num_instructions) {
         break;
 
       case Opcode::Call: {
-        Index func_index = ReadU32(&pc);
-        DefinedFunc* fn = cast<DefinedFunc>(env_->GetFunc(func_index));
+        IstreamOffset offset = ReadU32(&pc);
+        Environment::JITedFunction jit_fn;
+	DefinedFunc *df;
 
-        CHECK_TRAP(PushCall(pc));
-        GOTO(fn->offset);
-        CHECK_TRAP(env_->TryJit(this, fn, func_index));
+        if (env_->TryJit(this, offset, &jit_fn,df)) {
 
-        if (fn->jit_fn_) {
+          TRAP_IF(!jit_fn, FailedJITCompilation);
+
           in_jit_ = true;
 
-          jit_th_->pc = fn->offset;
-          jit_th_->in_jit = true;
-          jit_th_->call_stack = call_stack_.data() + call_stack_top_;
-          jit_th_->jit_fn_table = env_->jit_funcs_.data();
-
-          auto result = static_cast<Result>(fn->jit_fn_(jit_th_.get(), func_index));
-          call_stack_top_ = jit_th_->call_stack - call_stack_.data();
-
-          if (result != Result::Ok) {
-            pc_ = jit_th_->pc;
-            in_jit_ = jit_th_->in_jit;
-
+          if(env_->enable_load_from_dlib) {
+	    /*uint64_t (*func)(Value *,uint32_t *) = reinterpret_cast<uint64_t(*)(Value *,uint32_t *)>(jit_fn);
+	    auto result = func(value_stack_.data(),&value_stack_top_);
+	    Push<uint64_t>(result);*/
+	    // void(*func)(Thread*) = reinterpret_cast<void(*)(Thread*)>(jit_fn);
+	    //func(this);
+	    //Push<uint64_t>(7);
+	    //vs_top_-=2;
+	    /*void *handle = dlopen("/hdd/wasmjit-omr/tempmod1.so",RTLD_LAZY);
+	      const void *funct = dlsym(handle,std::string{"func_1"}.c_str());*/
+	    void(*func)(Thread*) = reinterpret_cast<void(*)(Thread*)>(jit_fn);
+	    auto previous_top = vs_top_;
+	    func(this);
+	    if(trapFlag) {
+	      tpc.Reload();
+	      trapFlag = false;
+	      return trapResult;
+	    }
+	    int change = vs_top_ - previous_top;
+	    /*(change==0){
+	      value_stack_top_=1;
+	      if((*value_stack_.data()).i32==0)
+		value_stack_top_=0;
+	    }else
+	    value_stack_top_=1+change;*/
+	    value_stack_top_ +=change;
+	    //jit_fn();
+	  } else if(env_->enable_load_thunk) {
+	    void *handle = dlopen(env_->infile,RTLD_LAZY);
+	    void *func = dlsym(handle,df->dbg_name_.c_str());
+	    int numCalleeParams = env_->GetFuncSignature(df->sig_index)->param_types.size();
+	   int memglcount = 0;
+	    if(env_->GetMemoryCount()>0){
+	      numCalleeParams++;
+	      memglcount++;
+	    }
+	    if(env_->GetGlobalCount()>0) {
+	      numCalleeParams++;
+	      memglcount++;
+	    }
+	    Value* params = new Value[numCalleeParams+1]();
+	    char** mems = nullptr;
+	    Value** globs = nullptr;
+	    if(env_->GetMemoryCount()>0){
+	      /*mems = new long*[env_->GetMemoryCount()];
+	      for(int j=0;j<env_->memories_.size();j++){
+		mems[j] = new long[env_->memories_[j].data.size()];
+		for(int k=0;k<env_->memories_[j].data.size();k++){
+		  memcpy(&mems[j][k],&env_->memories_[j].data[k],sizeof(long));
+		}
+		}*/
+	      mems = new char*[env_->GetMemoryCount()];
+	      for(int j=0;j<env_->memories_.size();j++){
+		mems[j] = env_->memories_[j].data.data();
+	       }
+	      memcpy(params,&mems,sizeof(char*));
+	    }
+	    if(env_->GetGlobalCount()>0) {
+	      globs = new Value*[env_->GetGlobalCount()]();
+	      for(int i=0;i<env_->globals_.size();i++){
+		globs[i] = &env_->globals_[i].typed_value.value;
+	      }
+	      if(env_->GetMemoryCount()>0)
+		memcpy(params+1,&globs,sizeof(void*));
+	      else
+		memcpy(params,&globs,sizeof(void*));
+	    }
+	    for(int i=numCalleeParams-1;i>=memglcount;i--) {//because thom's aot is using params in revers
+		params[i] = Pop();
+	    }
+	    Value res{0};
+	    if(env_->GetFuncSignature(df->sig_index)->result_types.size()>0){
+	      if (env_->GetFuncSignature(df->sig_index)->result_types.front()==
+		  Type::F32)
+	      {
+		  float(*fn)(void*,Value*) = (float(*)(void*,Value*))(jit_fn);
+		  float res1 = fn(func,params);
+		  memcpy(&res.f32_bits,&res1,sizeof(float));
+		  //res.f32_bits = res1;
+	      }else if (env_->GetFuncSignature(df->sig_index)->result_types.front()==
+			  Type::F64){
+		double(*fn)(void*,Value*) = (double(*)(void*,Value*))(jit_fn);
+		double res1 = fn(func,params);
+		memcpy(&res,&res1,sizeof(double));
+		//res.f64_bits = res1;
+	      }else{
+		Value(*fn)(void*,Value*) = (Value(*)(void*,Value*))(jit_fn);
+		res = fn(func,params);
+	      }
+	      if(trapFlag) {
+		tpc.Reload();
+		trapFlag = false;
+		return trapResult;
+	      }
+	      CHECK_TRAP(Push(res));
+	    }else{
+	      void(*fn)(void*,Value*) = (void(*)(void*,Value*))(jit_fn);
+	      fn(func,params);
+	      if(trapFlag) {
+		tpc.Reload();
+		trapFlag = false;
+		return trapResult;
+	      }
+	    }
+	    /*if(env_->GetMemoryCount()>0){
+	      for(int j=0;j<env_->memories_.size();j++){
+		for(int k=0;k<env_->memories_[j].data.size();k++){
+		  memcpy(&env_->memories_[j].data[k],&mems[j][k],sizeof(long));
+		}
+	      }
+	      }*/
+	    delete [] mems;
+	    delete [] globs;
+	    delete [] params;
+	  } else {
+	    auto result = jit_fn();
+	    if (result != Result::Ok) {
             // We don't want to overwrite the pc of the JITted function if it traps
-            tpc.Reload();
-            return result;
-          }
+	      tpc.Reload();
 
-          in_jit_ = false;
-          GOTO(PopCall());
+	      return result;
+	    }
+	  }
+          PopCall();
+        } else {
+	  printf("interpreting...\n");
+          CHECK_TRAP(PushCall(pc));
+          GOTO(offset);
+          //in_jit_ = false;
+          //GOTO(PopCall());
         }
         break;
       }
@@ -1874,33 +2098,27 @@ Result Thread::Run(int num_instructions) {
         if (func->is_host) {
           CHECK_TRAP(CallHost(cast<HostFunc>(func)));
         } else {
-          auto* fn = cast<DefinedFunc>(func);
+          auto* dfn = cast<DefinedFunc>(func);
+          Environment::JITedFunction jit_fn;
 
           CHECK_TRAP(PushCall(pc));
-          GOTO(fn->offset);
-          CHECK_TRAP(env_->TryJit(this, fn, func_index));
+          GOTO(dfn->offset);
 
-          if (fn->jit_fn_) {
+          if (env_->TryJit(this, dfn->offset, &jit_fn)) {
+            TRAP_IF(!jit_fn, FailedJITCompilation);
+
             in_jit_ = true;
 
-            jit_th_->pc = fn->offset;
-            jit_th_->in_jit = true;
-            jit_th_->call_stack = call_stack_.data() + call_stack_top_;
-            jit_th_->jit_fn_table = env_->jit_funcs_.data();
-
-            auto result = static_cast<Result>(fn->jit_fn_(jit_th_.get(), func_index));
-            call_stack_top_ = jit_th_->call_stack - call_stack_.data();
-
+            auto result = jit_fn();
             if (result != Result::Ok) {
-              pc_ = jit_th_->pc;
-              in_jit_ = jit_th_->in_jit;
-
               // We don't want to overwrite the pc of the JITted function if it traps
               tpc.Reload();
+
               return result;
             }
 
             in_jit_ = false;
+
             GOTO(PopCall());
           }
         }
@@ -1914,7 +2132,7 @@ Result Thread::Run(int num_instructions) {
       }
 
       case Opcode::ReturnCall: {
-        IstreamOffset offset = cast<DefinedFunc>(env_->GetFunc(ReadU32(&pc)))->offset;
+        IstreamOffset offset = ReadU32(&pc);
         GOTO(offset);
 
         break;
@@ -2166,7 +2384,7 @@ Result Thread::Run(int num_instructions) {
         PUSH_NEG_1_AND_BREAK_IF(new_page_size > max_page_size);
         PUSH_NEG_1_AND_BREAK_IF(
             static_cast<uint64_t>(new_page_size) * WABT_PAGE_SIZE > UINT32_MAX);
-        memory->data.resize(new_page_size * WABT_PAGE_SIZE);
+        //memory->data.resize(new_page_size * WABT_PAGE_SIZE);
         memory->page_limits.initial = new_page_size;
         CHECK_TRAP(Push<uint32_t>(old_page_size));
         break;
@@ -2865,6 +3083,101 @@ Result Thread::Run(int num_instructions) {
             SimdExtractLane<int32_t, v128, int32_t>(lane_val, lane_idx)));
         break;
       }
+/*
+Result Thread::CallThunk(Environment::JITedFunction jit_fn,Func *df) {
+  void *handle = dlopen(env_->infile,RTLD_LAZY);
+  if(!handle)
+    return wabt::interp::Result::TrapFailedAOTLookup;
+  void *func = dlsym(handle,df->dbg_name_.c_str());
+  if(!func)
+    return wabt::interp::Result::TrapFailedAOTLookup;
+   int numCalleeParams = env_->GetFuncSignature(df->sig_index)->param_types.size();
+   int memglcount = 0;
+    if(env_->GetMemoryCount()>0){
+      numCalleeParams++;
+      memglcount++;
+    }
+    if(env_->GetGlobalCount()>0) {
+      numCalleeParams++;
+      memglcount++;
+    }
+    Value* params = new Value[numCalleeParams+1]();
+    char** mems = nullptr;
+    Value** globs = nullptr;
+    if(env_->GetMemoryCount()>0){
+      /*mems = new long*[env_->GetMemoryCount()];
+      for(int j=0;j<env_->memories_.size();j++){
+	mems[j] = new long[env_->memories_[j].data.size()];
+	for(int k=0;k<env_->memories_[j].data.size();k++){
+	  memcpy(&mems[j][k],&env_->memories_[j].data[k],sizeof(long));
+	}
+	}*//*
+      mems = new char*[env_->GetMemoryCount()];
+      for(int j=0;j<env_->memories_.size();j++){
+	mems[j] = env_->memories_[j].data.data();
+       }
+      memcpy(params,&mems,sizeof(char*));
+    }
+    if(env_->GetGlobalCount()>0) {
+      globs = new Value*[env_->GetGlobalCount()]();
+      for(int i=0;i<env_->globals_.size();i++){
+	globs[i] = &env_->globals_[i].typed_value.value;
+      }
+      if(env_->GetMemoryCount()>0)
+	memcpy(params+1,&globs,sizeof(void*));
+      else
+	memcpy(params,&globs,sizeof(void*));
+    }
+    for(int i=numCalleeParams-1;i>=memglcount;i--) {//because thom's aot is using params in revers
+	params[i] = Pop();
+    }
+    Value res{0};
+    if(env_->GetFuncSignature(df->sig_index)->result_types.size()>0){
+      if (env_->GetFuncSignature(df->sig_index)->result_types.front()==
+	  Type::F32)
+      {
+	  float(*fn)(void*,Value*) = (float(*)(void*,Value*))(jit_fn);
+	  float res1 = fn(func,params);
+	  memcpy(&res.f32_bits,&res1,sizeof(float));
+	  //res.f32_bits = res1;
+      }else if (env_->GetFuncSignature(df->sig_index)->result_types.front()==
+		  Type::F64){
+	double(*fn)(void*,Value*) = (double(*)(void*,Value*))(jit_fn);
+	double res1 = fn(func,params);
+	memcpy(&res,&res1,sizeof(double));
+	//res.f64_bits = res1;
+      }else{
+	Value(*fn)(void*,Value*) = (Value(*)(void*,Value*))(jit_fn);
+	res = fn(func,params);
+      }
+      if(trapFlag) {
+	//tpc.Reload();
+	trapFlag = false;
+	return trapResult;
+      }
+      CHECK_TRAP(Push(res));
+    }else{
+      void(*fn)(void*,Value*) = (void(*)(void*,Value*))(jit_fn);
+      fn(func,params);
+      if(trapFlag) {
+	//tpc.Reload();
+	trapFlag = false;
+	return trapResult;
+      }
+    }
+    /*if(env_->GetMemoryCount()>0){
+      for(int j=0;j<env_->memories_.size();j++){
+	for(int k=0;k<env_->memories_[j].data.size();k++){
+	  memcpy(&env_->memories_[j].data[k],&mems[j][k],sizeof(long));
+	}
+      }
+      }*//*
+    delete [] mems;
+    delete [] globs;
+    delete [] params;
+    return Result::Ok;
+}*/
+
 
       case Opcode::I64X2ExtractLane: {
         v128 lane_val = static_cast<v128>(Pop<v128>());
@@ -3577,7 +3890,21 @@ exit_loop:
   return result;
 }
 
+void Environment::LoadDLib(char *filename) {
+  elfLoader = new ELFLoader(filename);
+}
+
+void Environment::FillMemories(){
+  if(mems==nullptr) {
+     mems = new char*[GetMemoryCount()];
+     for(int j=0;j<memories_.size();j++){
+       	mems[j] = memories_[j].data.data();
+     }
+  }
+}
+
 static void PrintCallFrame(Stream* s, Environment* e, const CallFrame* frame) {
+
   DefinedFunc* best_fn = nullptr;
 
   for (Index i = 0; i < e->GetFuncCount(); i++) {
@@ -3736,6 +4063,331 @@ void Executor::CopyResults(const FuncSignature* sig, TypedValues* out_results) {
   out_results->clear();
   for (size_t i = 0; i < expected_results; ++i)
     out_results->emplace_back(sig->result_types[i], thread_.ValueAt(i));
+}
+
+ELFLoader::ELFLoader(char *elfFileName):
+  _elfFileName(elfFileName),
+  _header(new ELFEHeader()),
+  _zeroSection(new ELFSectionHeader()),
+  _textSection(new ELFSectionHeader()),
+  _relaSection(new ELFSectionHeader()),
+  _dynSymSection(new ELFSectionHeader()),
+  _shStrTabSection(new ELFSectionHeader()),
+  _dynStrSection(new ELFSectionHeader()),
+  _text(NULL),
+  _symtab(NULL),
+  _rela(NULL),
+  _custom(NULL)
+{
+  initialize();
+}
+
+ELFLoader::~ELFLoader()
+{
+  fclose(_elfFile);
+  delete _header;
+  delete _zeroSection;
+  delete _textSection;
+  delete _relaSection;
+  delete _dynSymSection;
+  delete _shStrTabSection;
+  delete _dynStrSection;
+  free(_text);
+  delete[] _symtab;
+  delete[] _dynstr;
+  delete[] _rela;
+  delete[] _custom;
+}
+
+void ELFLoader::initialize()
+{
+  _elfFile = fopen(_elfFileName,"rb");
+  if(_elfFile!=NULL)
+  {
+    size_t bytesRead = fread(_header,1,64,_elfFile);
+    if(bytesRead!=64)
+    {
+      printf("Invalid ELF file format!");
+      return;
+    }
+    if(fseek(_elfFile,_header->e_shoff,SEEK_SET))
+    {
+      printf("Invalid ELF file format!");
+      return;
+    }
+    bytesRead = _header->e_shentsize;
+    if(bytesRead!=fread(_zeroSection,1,_header->e_shentsize,_elfFile))
+    {
+      printf("Cannot read section!");
+      return;
+    }
+    if(bytesRead!=fread(_textSection,1,_header->e_shentsize,_elfFile))
+    {
+      printf("Cannot read section!");
+      return;
+    }
+    if(bytesRead!=fread(_relaSection,1,_header->e_shentsize,_elfFile))
+    {
+      printf("Cannot read section!");
+      return;
+    }
+    if(bytesRead!=fread(_dynSymSection,1,_header->e_shentsize,_elfFile))
+    {
+      printf("Cannot read section!");
+      return;
+    }
+    if(bytesRead!=fread(_shStrTabSection,1,_header->e_shentsize,_elfFile))
+    {
+      printf("Cannot read section!");
+      return;
+    }
+    if(bytesRead!=fread(_dynStrSection,1,_header->e_shentsize,_elfFile))
+    {
+      printf("Cannot read section!");
+      return;
+    }
+    /*if(bytesRead!=fread(_customSection,1,_header->e_shentsize,_elfFile))
+    {
+      printf("Cannot read section!");
+      return;
+    }
+    char shStrTab[_shStrTabSection->sh_size];
+    fseek(_elfFile,_shStrTabSection->sh_offset,SEEK_SET);
+    fread(shStrTab,1,_shStrTabSection->sh_size,_elfFile);
+    memcpy(_zeroSectionName,&shStrTab[_zeroSection->sh_name],1);
+    memcpy(_textSectionName,&shStrTab[_textSection->sh_name],6);
+    memcpy(_relaSectionName,&shStrTab[_relaSection->sh_name],11);
+    memcpy(_dynSymSectionName,&shStrTab[_dynSymSection->sh_name],8);
+    memcpy(_shStrTabSectionName,&shStrTab[_shStrTabSection->sh_name],10);
+    memcpy(_dynStrSectionName,&shStrTab[_dynStrSection->sh_name],8);
+    memcpy(_customSectionName,&shStrTab[_customSection->sh_name],8);*/
+  }
+}
+
+void ELFLoader::loadTextSection()
+{
+  _text = malloc(_textSection->sh_size);
+  fseek(_elfFile,_textSection->sh_offset,SEEK_SET);
+  int bytesRead = _textSection->sh_size;
+  if(bytesRead!=fread(_text,1,_textSection->sh_size,_elfFile))
+  {
+    printf("Cannot read .text section!");
+    _text = NULL;
+    return;
+  }
+}
+
+void *ELFLoader::getTextSection()
+{
+  if(_text == NULL)
+    loadTextSection();
+  return _text;
+}
+
+void ELFLoader::loadSymTab()
+{
+  _symtab = new Elf64_Sym[_dynSymSection->sh_size/sizeof(Elf64_Sym)];
+  fseek(_elfFile,_dynSymSection->sh_offset,SEEK_SET);
+  int bytesRead = _dynSymSection->sh_size;
+  if(bytesRead!=fread(_symtab,1,_dynSymSection->sh_size,_elfFile))
+  {
+    printf("Cannot read .symtab section!");
+    _symtab=NULL;
+    return;
+  }
+}
+
+Elf64_Sym *ELFLoader::getSymbolTable()
+{
+  if(_symtab == NULL)
+    loadSymTab();
+  return _symtab;
+}
+
+void ELFLoader::loadDynStr()
+{
+  _dynstr = new char[_dynStrSection->sh_size];
+  fseek(_elfFile,_dynStrSection->sh_offset,SEEK_SET);
+  int bytesRead = _dynStrSection->sh_size;
+  if(bytesRead!=fread(_dynstr,1,_dynStrSection->sh_size,_elfFile))
+  {
+    printf("Cannot read .dynstr section!");
+    _dynstr = NULL;
+    return;
+  }
+}
+
+void ELFLoader::loadRela()
+{
+  _rela = new Elf64_Rela[_relaSection->sh_size/sizeof(Elf64_Rela)];
+  fseek(_elfFile,_relaSection->sh_offset,SEEK_SET);
+  int bytesRead = _relaSection->sh_size;
+  if(bytesRead!=fread(_rela,1,_relaSection->sh_size,_elfFile))
+  {
+    printf("Cannot read .rela.text section!");
+    _rela = NULL;
+    return;
+  }
+}
+
+void ELFLoader::printHeader()
+{
+  printf("ELF Header:\n");
+  printf("Magic: ");
+  for(int i=0;i<16;i++)
+    printf("%02x ",_header->e_ident[i]);
+  printf("\n");
+  printf("Class: %s",_header->e_ident[4]==ELFCLASS64?"ELF64\n":"ELF32\n");
+  printf("Data: %s",_header->e_ident[5]==ELFDATA2LSB?
+	 "2's complement, little endian\n":"2's complement, big endian\n");
+  printf("Version: %s",_header->e_ident[6]==EV_CURRENT?"1 (current)\n":"0");
+  printf("OS/ABI: %s",_header->e_ident[7]==ELFOSABI_LINUX?
+	 "UNIX-GNU\n":"UNIX - System V\n");
+  printf("ABI Version: %d\n",_header->e_ident[8]);
+  printf("Type: %s\n",_header->e_type==ET_REL?
+	 "REL (Relocatable file)":"DYN (Shared object file)");
+  printf("Machine: %s\n",_header->e_machine==EM_X86_64?
+	 "Advanced Micro Devices X86-64":"Intel 80386");
+  printf("Version: 0x%x\n",_header->e_version);
+  printf("Entry point address: 0x%lx\n",_header->e_entry);
+  printf("Start of program headers: %lu (bytes into file)\n",_header->e_phoff);
+  printf("Start of section headers: %lu (bytes into file)\n",_header->e_shoff);
+  printf("Flags: 0x%x\n",_header->e_flags);
+  printf("Size of this header: %d (bytes)\n",_header->e_ehsize);
+  printf("Size of program headers: %d (bytes)\n",_header->e_phentsize);
+  printf("Number of program headers: %d\n",_header->e_phnum);
+  printf("Size of section headers: %d (bytes)\n",_header->e_shentsize);
+  printf("Number of section headers: %d\n",_header->e_shnum);
+  printf("Section header string table index: %d\n",_header->e_shstrndx);
+  
+}
+
+char *ELFLoader::typeString(ELFSectionHeader *sect)
+{
+  switch(sect->sh_type){
+  case SHT_NULL:
+    return "NULL";
+  case SHT_PROGBITS:
+    return "PROGBITS";
+  case SHT_SYMTAB:
+    return "SYMTAB";
+  case SHT_STRTAB:
+    return "STRTAB";
+  case SHT_RELA:
+    return "RELA";
+  default:
+    return "";
+  }
+}
+
+char *ELFLoader::flagString(ELFSectionHeader *sect)
+{
+  char *ret = new char[14];
+  strcpy(ret,"");
+  int flag = sect->sh_flags;
+  if(BIT(flag,0))
+    strcat(ret,"W");
+  if(BIT(flag,1))
+    strcat(ret,"A");
+  if(BIT(flag,2))
+    strcat(ret,"X");
+  return ret;
+}
+
+void ELFLoader::printSymbolTable()
+{
+  if(_symtab==0)
+    loadSymTab();
+  printf("Symbol table '.symtab' contains %d entries:",_dynSymSection->sh_size/sizeof(Elf64_Sym));
+  printf("Num:    Value          Size Type    Bind   Vis      Ndx Name");
+  for(int i=0;i<(_dynSymSection->sh_size/sizeof(Elf64_Sym));i++)
+  {
+    printf("%d: %016x %lu %s %s %s %s %s",i,_symtab[i].st_value,_symtab[i].st_size,symTypeString(_symtab[i]),
+	   symBindString(_symtab[i]),symVisString(_symtab[i]),symNdxString(_symtab[i]),symNameString(_symtab[i]));
+  }
+}
+
+char *ELFLoader::symTypeString(Elf64_Sym sym)
+{
+  char type = ELF64_ST_TYPE(sym.st_info);
+  switch(type)
+  {
+  case STT_NOTYPE:
+    return "NOTYPE";
+  case STT_FUNC:
+    return "FUNC";
+  case STT_FILE:
+    return "FILE";
+  case STT_OBJECT:
+    return "OBJECT";
+  default:
+    return "";
+  }
+}
+
+char *ELFLoader::symBindString(Elf64_Sym sym)
+{
+  char bind = ELF64_ST_BIND(sym.st_info);
+  switch(bind)
+  {
+  case STB_LOCAL:
+    return "LOCAL";
+  case STB_GLOBAL:
+    return "GLOBAL";
+  default:
+    return "";
+  }
+}
+
+char *ELFLoader::symVisString(Elf64_Sym sym)
+{
+  switch(ELF64_ST_VISIBILITY(sym.st_other))
+  {
+  case STV_DEFAULT:
+    return "DEFAULT";
+  case STV_INTERNAL:
+    return "INTERNAL";
+  case STV_HIDDEN:
+    return "HIDDEN";
+  default:
+    return "";
+  }
+}
+
+char *ELFLoader::symNdxString(Elf64_Sym sym)
+{
+  if(sym.st_shndx == SHN_UNDEF)
+    return "UND";
+  else
+    return new char('0'+sym.st_shndx);
+}
+
+char *ELFLoader::symNameString(Elf64_Sym sym)
+{
+  if(_dynstr == NULL)
+    loadDynStr();
+
+  return &_dynstr[sym.st_name];
+}
+
+void ELFLoader::loadCustom()
+{
+  _custom = new unsigned int[_customSection->sh_size/sizeof(int)];
+  fseek(_elfFile,_customSection->sh_offset,SEEK_SET);
+  int bytesRead = _customSection->sh_size;
+  if(bytesRead!=fread(_custom,1,_customSection->sh_size,_elfFile))
+  {
+    printf("Cannot read custom section!");
+    _custom=NULL;
+    return;
+  }
+}
+
+unsigned int *ELFLoader::getCustomSection()
+{
+  if(_custom == NULL)
+    loadCustom();
+  return _custom;
 }
 
 }  // namespace interp

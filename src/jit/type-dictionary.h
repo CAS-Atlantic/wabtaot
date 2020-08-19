@@ -17,10 +17,41 @@
 #ifndef TYPEDICTIONARY_HPP
 #define TYPEDICTIONARY_HPP
 
+#include <time.h>
 #include "ilgen/TypeDictionary.hpp"
 
 namespace wabt {
 namespace jit {
+/*
+class TypeDictionary : public OMR::JitBuilder::TypeDictionary {
+ public:
+  TypeDictionary();
+  OMR::JitBuilder::IlType *stackElement;
+  OMR::JitBuilder::IlType *stackElementPtr;
+  //OMR::JitBuilder::IlType *instruction;
+  //OMR::JitBuilder::IlType *instructionPtr;
+
+  //OMR::JitBuilder::IlType *operandStack;
+  //OMR::JitBuilder::IlType *operandStackPtr;
+  OMR::JitBuilder::IlType *thread;
+  OMR::JitBuilder::IlType *threadPtr;
+  OMR::JitBuilder::IlType *stackTop;
+};
+
+class AOTTypeDictionary : public OMR::JitBuilder::TypeDictionary {
+ public:
+  AOTTypeDictionary();
+  OMR::JitBuilder::IlType *stackElement;
+  OMR::JitBuilder::IlType *stackElementPtr;
+  //TR::IlType *instruction;
+  //TR::IlType *instructionPtr;
+
+  //TR::IlType *operandStack;
+  //TR::IlType *operandStackPtr;
+  OMR::JitBuilder::IlType *thread;
+  OMR::JitBuilder::IlType *threadPtr;
+  OMR::JitBuilder::IlType *stackTop;
+};*/
 
 class TypeDictionary : public TR::TypeDictionary {
  public:
