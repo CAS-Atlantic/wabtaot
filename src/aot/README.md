@@ -10,6 +10,7 @@ Eclipse OMR code is included in the project as a submodule in the `third_party` 
 ## Building
 
 When the project is compiled, a `wabtaot` executable will be created to represent the AOT compiler and runtime.
+Usually built with `make gcc-debug`.
 
 ## Code information
 
